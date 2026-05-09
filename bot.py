@@ -301,6 +301,7 @@ def morning_briefing():
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True)
+    logging.info(f"Webhook received: {data}")
     if not data:
         return "ok"
 
@@ -310,8 +311,10 @@ def webhook():
 
     chat_id = msg.get("chat", {}).get("id")
     text    = msg.get("text", "").strip()
+    logging.info(f"Message from chat_id={chat_id}, CHAT_ID={CHAT_ID}, text={text!r}")
 
     if chat_id != CHAT_ID or not text:
+        logging.warning(f"Rejected: chat_id mismatch ({chat_id} != {CHAT_ID}) or empty text")
         return "ok"
 
     try:
