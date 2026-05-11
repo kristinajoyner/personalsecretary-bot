@@ -336,8 +336,10 @@ def index():
 def start_scheduler():
     from apscheduler.triggers.cron import CronTrigger
     import pytz
-    scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Ho_Chi_Minh"))
-    scheduler.add_job(morning_briefing, CronTrigger(hour=8, minute=0))
+    vn_tz = pytz.timezone("Asia/Ho_Chi_Minh")
+    scheduler = BackgroundScheduler()
+    # Chỉ định timezone trực tiếp trong CronTrigger để đảm bảo đúng 8:00 sáng Việt Nam
+    scheduler.add_job(morning_briefing, CronTrigger(hour=8, minute=0, timezone=vn_tz))
     scheduler.start()
     logging.info("Scheduler started — morning briefing at 08:00 Asia/Ho_Chi_Minh")
 
