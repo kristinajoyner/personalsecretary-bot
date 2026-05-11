@@ -264,21 +264,39 @@ def process_message(user_text):
     return reply
 
 # ══════════════════════════════════════════════════════════════
-#  NHẮC LỊCH BUỔI SÁNG (chạy tự động lúc 8:00 sáng)
+#  HÀM NHẮC NHỞ CHUNG (dùng cho sáng / trưa / chiều)
 # ══════════════════════════════════════════════════════════════
-def morning_briefing():
+def send_reminder(session: str):
+    """
+    session = "morning" | "noon" | "evening"
+    Chỉ gửi nếu còn task chưa xong.
+    Buổi sáng luôn gửi (kể cả khi trống).
+    Buổi trưa/chiều chỉ gửi khi còn task tồn đọng.
+    """
     tasks  = get_tasks()
     active = [t for t in tasks if not t["done"]]
     now    = vn_now()
 
+    # Buổi trưa/chiều — không gửi nếu không còn việc
+    if session != "morning" and not active:
+        logging.info(f"{session} reminder skipped — no pending tasks")
+        return
+
+    headers = {
+        "morning": ("🌅", "CHÀO BUỔI SÁNG!", "💪 Chúc bạn ngày làm việc hiệu quả!"),
+        "noon":    ("☀️", "NHẮC VIỆC BUỔI TRƯA", "🍱 Tranh thủ giải quyết trước khi nghỉ trưa nhé!"),
+        "evening": ("🌆", "NHẮC VIỆC BUỔI CHIỀU", "🏁 Cố lên, còn một chút nữa là xong ngày!"),
+    }
+    icon, title, footer = headers[session]
+
     lines = [
-        "🌅 <b>CHÀO BUỔI SÁNG!</b>",
-        f"📅 <b>{THU[now.weekday()]}, {now.strftime('%d/%m/%Y')}</b>",
+        f"{icon} <b>{title}</b>",
+        f"📅 <b>{THU[now.weekday()]}, {now.strftime('%d/%m/%Y %H:%M')}</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━"
     ]
 
     if not active:
-        lines += ["", "📋 Hôm nay chưa có việc gì.", "Nhắn cho tôi để lên kế hoạch nhé! 😊"]
+        lines += ["", "✅ Không có việc gì tồn đọng.", "Hãy nhắn cho tôi nếu cần lên kế hoạch! 😊"]
     else:
         groups = {1: [], 2: [], 3: []}
         for t in active:
@@ -290,10 +308,11 @@ def morning_briefing():
                 for t in groups[p]:
                     dl = f" ⏰{t['deadline']}" if t.get("deadline") else ""
                     lines.append(f"  • {t['tieu_de']}{dl}")
+        lines += ["", f"📌 Còn <b>{len(active)} việc</b> chưa xong — nhắn 'xong việc X' khi hoàn thành!"]
 
-    lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━━", "💪 Chúc bạn ngày làm việc hiệu quả!"]
+    lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━━", footer]
     send_telegram("\n".join(lines))
-    logging.info("Morning briefing sent!")
+    logging.info(f"{session} reminder sent ({len(active)} active tasks)")
 
 # ══════════════════════════════════════════════════════════════
 #  FLASK ROUTES
@@ -338,10 +357,16 @@ def start_scheduler():
     import pytz
     vn_tz = pytz.timezone("Asia/Ho_Chi_Minh")
     scheduler = BackgroundScheduler()
-    # Chỉ định timezone trực tiếp trong CronTrigger để đảm bảo đúng 8:00 sáng Việt Nam
-    scheduler.add_job(morning_briefing, CronTrigger(hour=8, minute=0, timezone=vn_tz))
+
+    # 8:00 sáng — nhắc đầu ngày (luôn gửi)
+    scheduler.add_job(lambda: send_reminder("morning"), CronTrigger(hour=8,  minute=0, timezone=vn_tz))
+    # 12:00 trưa — nhắc giữa ngày (chỉ gửi nếu còn task)
+    scheduler.add_job(lambda: send_reminder("noon"),    CronTrigger(hour=12, minute=0, timezone=vn_tz))
+    # 17:00 chiều — nhắc cuối ngày (chỉ gửi nếu còn task)
+    scheduler.add_job(lambda: send_reminder("evening"), CronTrigger(hour=17, minute=0, timezone=vn_tz))
+
     scheduler.start()
-    logging.info("Scheduler started — morning briefing at 08:00 Asia/Ho_Chi_Minh")
+    logging.info("Scheduler started — reminders at 08:00 / 12:00 / 17:00 Asia/Ho_Chi_Minh")
 
 # Chỉ khởi động scheduler 1 lần (tránh trùng khi Flask debug reload)
 if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
