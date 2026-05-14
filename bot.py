@@ -1,10 +1,9 @@
 """
-THƯ KÝ CÁ NHÂN - Telegram Bot (Railway edition)
-================================================
-- Hiểu tiếng Việt tự nhiên (powered by Claude AI)
-- Quản lý công việc theo ưu tiên
-- Tự nhắc lịch 8:00 sáng mỗi ngày (APScheduler)
-- Chạy 24/7 trên Railway
+THƯ KÝ CÁ NHÂN - Telegram Bot (Railway + PostgreSQL)
+=====================================================
+- Lưu task vào PostgreSQL → không mất khi redeploy
+- Nhắc việc lúc 8:00 / 12:00 / 17:00 giờ Việt Nam
+- Task chưa xong → nhắc mãi đến khi xác nhận hoàn thành
 """
 
 import json
@@ -14,6 +13,8 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 import anthropic
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -27,38 +28,65 @@ app = Flask(__name__)
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 CHAT_ID       = int(os.environ["CHAT_ID"])
 ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
-
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
-TASKS_FILE   = os.path.join(BASE_DIR, "tasks.json")
-HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
+DATABASE_URL  = os.environ["DATABASE_URL"]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 THU    = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
+
+# ══════════════════════════════════════════════════════════════
+#  DATABASE — lưu trữ vĩnh viễn, không mất khi redeploy
+# ══════════════════════════════════════════════════════════════
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def init_db():
+    """Tạo bảng nếu chưa có"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS store (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+        conn.commit()
+    logging.info("Database initialized")
+
+def db_get(key, default):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM store WHERE key = %s", (key,))
+                row = cur.fetchone()
+                if row:
+                    return json.loads(row[0])
+    except Exception as e:
+        logging.error(f"DB get error [{key}]: {e}")
+    return default
+
+def db_set(key, value):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO store (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (key, json.dumps(value, ensure_ascii=False)))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"DB set error [{key}]: {e}")
+
+def get_tasks():
+    return db_get("tasks", [])
+
+def save_tasks(tasks):
+    db_set("tasks", tasks)
 
 # ══════════════════════════════════════════════════════════════
 #  UTILS
 # ══════════════════════════════════════════════════════════════
 def vn_now():
     return datetime.now(timezone(timedelta(hours=7)))
-
-def load_json(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
-
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def get_tasks():
-    return load_json(TASKS_FILE, [])
-
-def save_tasks(tasks):
-    save_json(TASKS_FILE, tasks)
 
 def send_telegram(text, chat_id=CHAT_ID):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -78,7 +106,7 @@ def send_telegram(text, chat_id=CHAT_ID):
 TOOLS = [
     {
         "name": "them_viec",
-        "description": "Thêm một công việc mới vào danh sách. Gọi khi chủ nhân giao việc hoặc đặt lịch.",
+        "description": "Thêm một công việc mới vào danh sách. Gọi ngay khi chủ nhân giao việc.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -102,7 +130,7 @@ TOOLS = [
     },
     {
         "name": "xoa_viec",
-        "description": "Xóa một công việc khỏi danh sách.",
+        "description": "Xóa hẳn một công việc khỏi danh sách.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -151,7 +179,7 @@ def handle_tool(name, inp):
                 if t["id"] == active[idx]["id"]:
                     t["done"] = True
                     save_tasks(tasks)
-                    return f"Đã đánh dấu xong: {t['tieu_de']}"
+                    return f"✅ Đã đánh dấu xong: {t['tieu_de']}"
         return "Không tìm thấy công việc đó"
 
     elif name == "xoa_viec":
@@ -212,15 +240,15 @@ def build_system():
 {viec}
 
 NGUYÊN TẮC:
-• Chủ nhân giao việc → gọi them_viec ngay
-• Chủ nhân báo xong → gọi hoan_thanh
-• Hỏi danh sách/lịch → gọi xem_danh_sach
-• Muốn xóa → gọi xoa_viec | Muốn dọn dẹp → gọi don_dep
+• Chủ nhân giao việc → gọi them_viec NGAY, không hỏi lại
+• Chủ nhân báo xong / hoàn thành / done → gọi hoan_thanh NGAY
+• Hỏi danh sách / còn việc gì → gọi xem_danh_sach
+• Muốn xóa → gọi xoa_viec | Dọn dẹp → gọi don_dep
 • Trả lời ngắn gọn 1–3 câu, thân thiện, dùng emoji
 • Sau khi dùng tool → xác nhận kết quả cho chủ nhân"""
 
 def process_message(user_text):
-    history  = load_json(HISTORY_FILE, [])
+    history  = db_get("history", [])
     messages = history[-20:] + [{"role": "user", "content": user_text}]
 
     for _ in range(5):
@@ -260,24 +288,17 @@ def process_message(user_text):
 
     history.append({"role": "user",      "content": user_text})
     history.append({"role": "assistant", "content": reply})
-    save_json(HISTORY_FILE, history[-40:])
+    db_set("history", history[-40:])
     return reply
 
 # ══════════════════════════════════════════════════════════════
-#  HÀM NHẮC NHỞ CHUNG (dùng cho sáng / trưa / chiều)
+#  NHẮC NHỞ TỰ ĐỘNG (8:00 / 12:00 / 17:00)
 # ══════════════════════════════════════════════════════════════
 def send_reminder(session: str):
-    """
-    session = "morning" | "noon" | "evening"
-    Chỉ gửi nếu còn task chưa xong.
-    Buổi sáng luôn gửi (kể cả khi trống).
-    Buổi trưa/chiều chỉ gửi khi còn task tồn đọng.
-    """
     tasks  = get_tasks()
     active = [t for t in tasks if not t["done"]]
     now    = vn_now()
 
-    # Buổi trưa/chiều — không gửi nếu không còn việc
     if session != "morning" and not active:
         logging.info(f"{session} reminder skipped — no pending tasks")
         return
@@ -291,12 +312,12 @@ def send_reminder(session: str):
 
     lines = [
         f"{icon} <b>{title}</b>",
-        f"📅 <b>{THU[now.weekday()]}, {now.strftime('%d/%m/%Y %H:%M')}</b>",
+        f"📅 <b>{THU[now.weekday()]}, {now.strftime('%d/%m/%Y')}</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━"
     ]
 
     if not active:
-        lines += ["", "✅ Không có việc gì tồn đọng.", "Hãy nhắn cho tôi nếu cần lên kế hoạch! 😊"]
+        lines += ["", "✅ Không có việc gì tồn đọng!", "Hãy nhắn cho tôi nếu cần lên kế hoạch 😊"]
     else:
         groups = {1: [], 2: [], 3: []}
         for t in active:
@@ -308,7 +329,7 @@ def send_reminder(session: str):
                 for t in groups[p]:
                     dl = f" ⏰{t['deadline']}" if t.get("deadline") else ""
                     lines.append(f"  • {t['tieu_de']}{dl}")
-        lines += ["", f"📌 Còn <b>{len(active)} việc</b> chưa xong — nhắn 'xong việc X' khi hoàn thành!"]
+        lines += ["", f"📌 Còn <b>{len(active)} việc</b> chưa xong — nhắn 'xong việc X' để đánh dấu hoàn thành!"]
 
     lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━━", footer]
     send_telegram("\n".join(lines))
@@ -320,7 +341,6 @@ def send_reminder(session: str):
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True)
-    logging.info(f"Webhook received: {data}")
     if not data:
         return "ok"
 
@@ -330,10 +350,10 @@ def webhook():
 
     chat_id = msg.get("chat", {}).get("id")
     text    = msg.get("text", "").strip()
-    logging.info(f"Message from chat_id={chat_id}, CHAT_ID={CHAT_ID}, text={text!r}")
+
+    logging.info(f"Message from chat_id={chat_id}, text={text!r}")
 
     if chat_id != CHAT_ID or not text:
-        logging.warning(f"Rejected: chat_id mismatch ({chat_id} != {CHAT_ID}) or empty text")
         return "ok"
 
     try:
@@ -357,18 +377,14 @@ def start_scheduler():
     import pytz
     vn_tz = pytz.timezone("Asia/Ho_Chi_Minh")
     scheduler = BackgroundScheduler()
-
-    # 8:00 sáng — nhắc đầu ngày (luôn gửi)
     scheduler.add_job(lambda: send_reminder("morning"), CronTrigger(hour=8,  minute=0, timezone=vn_tz))
-    # 12:00 trưa — nhắc giữa ngày (chỉ gửi nếu còn task)
     scheduler.add_job(lambda: send_reminder("noon"),    CronTrigger(hour=12, minute=0, timezone=vn_tz))
-    # 17:00 chiều — nhắc cuối ngày (chỉ gửi nếu còn task)
     scheduler.add_job(lambda: send_reminder("evening"), CronTrigger(hour=17, minute=0, timezone=vn_tz))
-
     scheduler.start()
-    logging.info("Scheduler started — reminders at 08:00 / 12:00 / 17:00 Asia/Ho_Chi_Minh")
+    logging.info("Scheduler started — 08:00 / 12:00 / 17:00 Asia/Ho_Chi_Minh")
 
-# Chỉ khởi động scheduler 1 lần (tránh trùng khi Flask debug reload)
+init_db()
+
 if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     start_scheduler()
 
