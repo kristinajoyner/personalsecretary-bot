@@ -37,7 +37,7 @@ THU    = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Th�
 #  DATABASE — lưu trữ vĩnh viễn, không mất khi redeploy
 # ══════════════════════════════════════════════════════════════
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return psycopg2.connect(DATABASE_URL, sslmode="prefer")
 
 def init_db():
     """Tạo bảng nếu chưa có"""
