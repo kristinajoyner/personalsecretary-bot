@@ -37,7 +37,8 @@ THU    = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Th�
 #  DATABASE — lưu trữ vĩnh viễn, không mất khi redeploy
 # ══════════════════════════════════════════════════════════════
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="prefer")
+    # sslmode=disable: Railway internal network không cần SSL, disable rõ ràng hơn prefer
+    return psycopg2.connect(DATABASE_URL, sslmode="disable", connect_timeout=10)
 
 def init_db():
     """Tạo bảng nếu chưa có"""
@@ -65,22 +66,41 @@ def db_get(key, default):
     return default
 
 def db_set(key, value):
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO store (key, value) VALUES (%s, %s)
-                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-                """, (key, json.dumps(value, ensure_ascii=False)))
-            conn.commit()
-    except Exception as e:
-        logging.error(f"DB set error [{key}]: {e}")
+    """Lưu dữ liệu vào DB — retry 3 lần nếu thất bại"""
+    import time
+    json_val = json.dumps(value, ensure_ascii=False)
+    for attempt in range(3):
+        try:
+            conn = get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO store (key, value) VALUES (%s, %s)
+                        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                    """, (key, json_val))
+                conn.commit()
+            finally:
+                conn.close()
+            # Xác nhận lại sau khi save
+            saved = db_get(key, None)
+            if saved is not None:
+                logging.info(f"DB set OK [{key}] attempt={attempt+1}")
+                return True
+            else:
+                logging.warning(f"DB set verify failed [{key}] attempt={attempt+1}")
+        except Exception as e:
+            logging.error(f"DB set error [{key}] attempt={attempt+1}: {e}")
+        time.sleep(1)
+    # Tất cả 3 lần đều thất bại → báo cho người dùng
+    logging.error(f"DB set FAILED after 3 attempts [{key}]")
+    send_telegram(f"⚠️ Lỗi nghiêm trọng: không lưu được dữ liệu [{key}] vào DB sau 3 lần thử! Hãy báo lỗi này.")
+    return False
 
 def get_tasks():
     return db_get("tasks", [])
 
 def save_tasks(tasks):
-    db_set("tasks", tasks)
+    return db_set("tasks", tasks)
 
 # ══════════════════════════════════════════════════════════════
 #  UTILS
@@ -148,6 +168,11 @@ TOOLS = [
         "name": "don_dep",
         "description": "Xóa tất cả công việc đã hoàn thành khỏi danh sách.",
         "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "xoa_het",
+        "description": "Xóa TOÀN BỘ danh sách công việc và bắt đầu lại từ đầu. Gọi khi chủ nhân nói: xóa hết, reset, làm mới, bắt đầu lại, clear all.",
+        "input_schema": {"type": "object", "properties": {}}
     }
 ]
 
@@ -166,7 +191,9 @@ def handle_tool(name, inp):
             "tao_luc": vn_now().strftime("%d/%m %H:%M")
         }
         tasks.append(task)
-        save_tasks(tasks)
+        ok = save_tasks(tasks)
+        if not ok:
+            return f"❌ LỖI: Không lưu được task '{task['tieu_de']}' vào DB! Hãy thử lại."
         p_label = {1: "Khẩn cấp", 2: "Quan trọng", 3: "Thấp"}.get(task["uu_tien"], "")
         dl = f" | Deadline: {task['deadline']}" if task.get("deadline") else ""
         return f"Đã thêm: {task['tieu_de']} ({p_label}{dl})"
@@ -178,7 +205,9 @@ def handle_tool(name, inp):
             for t in tasks:
                 if t["id"] == active[idx]["id"]:
                     t["done"] = True
-                    save_tasks(tasks)
+                    ok = save_tasks(tasks)
+                    if not ok:
+                        return f"❌ LỖI: Không lưu được trạng thái hoàn thành cho '{t['tieu_de']}' vào DB!"
                     return f"✅ Đã đánh dấu xong: {t['tieu_de']}"
         return "Không tìm thấy công việc đó"
 
@@ -189,7 +218,9 @@ def handle_tool(name, inp):
             rid = active[idx]["id"]
             ten = active[idx]["tieu_de"]
             tasks = [t for t in tasks if t["id"] != rid]
-            save_tasks(tasks)
+            ok = save_tasks(tasks)
+            if not ok:
+                return f"❌ LỖI: Không xóa được task '{ten}' khỏi DB!"
             return f"Đã xóa: {ten}"
         return "Không tìm thấy công việc đó"
 
@@ -214,6 +245,11 @@ def handle_tool(name, inp):
         removed = before - len(tasks)
         save_tasks(tasks)
         return f"Đã dọn {removed} việc đã hoàn thành."
+
+    elif name == "xoa_het":
+        save_tasks([])
+        db_set("history", [])
+        return "Đã xóa toàn bộ danh sách và lịch sử. Danh sách trống, sẵn sàng bắt đầu lại!"
 
     return "Không rõ lệnh"
 
@@ -243,7 +279,7 @@ NGUYÊN TẮC:
 • Chủ nhân giao việc → gọi them_viec NGAY, không hỏi lại
 • Chủ nhân báo xong / hoàn thành / done → gọi hoan_thanh NGAY
 • Hỏi danh sách / còn việc gì → gọi xem_danh_sach
-• Muốn xóa → gọi xoa_viec | Dọn dẹp → gọi don_dep
+• Muốn xóa → gọi xoa_viec | Dọn dẹp → gọi don_dep | Reset toàn bộ → gọi xoa_het
 • Trả lời ngắn gọn 1–3 câu, thân thiện, dùng emoji
 • Sau khi dùng tool → xác nhận kết quả cho chủ nhân"""
 
@@ -368,6 +404,23 @@ def webhook():
 @app.route("/")
 def index():
     return "🤖 Thư Ký Bot đang hoạt động!"
+
+@app.route("/ping")
+def ping():
+    """Kiểm tra DB nhanh — truy cập URL/ping để xem số task hiện tại"""
+    try:
+        tasks  = get_tasks()
+        active = [t for t in tasks if not t["done"]]
+        done   = [t for t in tasks if t["done"]]
+        return {
+            "status": "ok",
+            "total_tasks": len(tasks),
+            "active": len(active),
+            "done": len(done),
+            "active_titles": [t["tieu_de"] for t in active]
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}, 500
 
 # ══════════════════════════════════════════════════════════════
 #  KHỞI ĐỘNG
