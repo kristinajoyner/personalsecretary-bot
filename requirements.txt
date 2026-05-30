@@ -1,7 +1,5 @@
 flask
-anthropic
 requests
 gunicorn
 apscheduler
 pytz
-psycopg2-binary
